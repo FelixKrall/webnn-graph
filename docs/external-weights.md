@@ -1,102 +1,116 @@
 # External weight format
 
-A `GraphJson` constant with `ConstInit::Weights { ref }`, rendered in `.webnn` as
-`@weights("ref")`, obtains its bytes from a sidecar. The graph declaration remains authoritative for
-the logical data type and shape.
+A `GraphJson` constant with `ConstInit::Weights { ref }`, rendered in `.webnn` as `@weights("ref")`, obtains
+its bytes from a sidecar. The graph declaration remains authoritative for the logical data type and shape.
+
+Two sidecar families are supported:
+
+- a self-describing SafeTensors archive;
+- an opaque `.weights` byte blob addressed by a JSON manifest.
 
 ## Discovery
 
-An explicit weights path is resolved relative to the graph. Without one, discovery checks, in order:
+An explicit weights path is resolved relative to the graph file. Without one, discovery checks in order:
 
 1. `<graph-stem>.safetensors`
 2. `<graph-stem>.weights`
 3. `model.safetensors`
 4. `model.weights`
 
-A SafeTensors file is self-describing and ignores a manifest argument. A raw `.weights` file requires
-an explicit manifest or a discovered `<graph-stem>.manifest.json` or `manifest.json`. Manifest byte ranges
-are validated before they are copied.
+The first existing path wins. A SafeTensors path ignores the manifest argument. A `.weights` path requires an
+explicit manifest or a discovered `<graph-stem>.manifest.json` or `manifest.json`.
 
-Files are memory-mapped read-only during resolution. Each selected tensor is copied once into the owned
-`InlineBytes` representation used by `GraphJson` consumers.
+Exact tensor names take precedence. As a compatibility fallback, archive and manifest names are normalized by
+replacing `::` with `__` and `.` with `_`. Resolution fails when more than one stored name normalizes to the
+same requested reference.
 
-## SafeTensors mapping
+## Loading and ownership
 
-Logical types use the corresponding SafeTensors type: `float32`/F32, `float16`/F16, `int32`/I32,
-`uint32`/U32, `int64`/I64, `uint64`/U64, `int8`/I8, and `uint8`/U8. A BF16 tensor may satisfy a
-`float32` declaration; it is converted to F32 while loading. Shapes must otherwise match exactly.
+SafeTensors and raw `.weights` files are memory-mapped read-only while references are resolved. The mapping is
+dropped after every selected tensor range has been copied once into the owned `InlineBytes` representation used
+by `GraphJson` consumers. The format does not provide decode-time weight streaming.
 
-SafeTensors has no native 4-bit type. Logical `int4` and `uint4` declarations use the versioned extension:
+Callers must keep a sidecar immutable while it is being resolved. Producers should complete a temporary file
+and rename it into place rather than modifying an installed archive.
 
-- archive metadata: `rustnn.webnn.packed4=1`
+## SafeTensors
+
+Ordinary logical types use the corresponding SafeTensors storage type:
+
+| Graph declaration | SafeTensors storage |
+| --- | --- |
+| `float32` | F32 |
+| `float16` | F16 |
+| `int32` | I32 |
+| `uint32` | U32 |
+| `int64` | I64 |
+| `uint64` | U64 |
+| `int8` | I8 |
+| `uint8` | U8 |
+
+A BF16 tensor may satisfy a `float32` declaration. The loader converts its values to F32. Other dtype
+mismatches are rejected, and ordinary tensor shapes must match the graph declaration exactly.
+
+### Packed Int4 and Uint4
+
+SafeTensors has no native 4-bit storage type. Logical `int4` and `uint4` declarations use this versioned
+extension:
+
+- archive metadata key: `rustnn.webnn.packed4`
+- supported metadata value: `1`
 - physical SafeTensors type: U8
 - physical shape: `[ceil(logical_element_count / 2)]`
-- byte layout: the first logical element is the low nibble, followed by the high nibble
+- byte layout: the first logical element occupies the low nibble and the second occupies the high nibble
 
-The loader requires the marker when a graph references an external 4-bit tensor and rejects unknown
-versions, non-U8 storage, incorrect physical shapes, length overflow, or missing references. Archives that
-contain only ordinary tensors need no marker and remain compatible with earlier files.
+The `.webnn` or `GraphJson` declaration retains the logical 4-bit dtype and original shape. The loader requires
+the marker whenever an archive is used for an external 4-bit declaration. It rejects a missing or unknown
+marker, non-U8 storage, an incorrect physical shape or byte count, overflow, and missing references.
 
-## Names
+Archives containing only ordinary tensors need no packed-4-bit marker and remain compatible with earlier files.
 
-Exact tensor names take precedence. As a compatibility fallback, archive and manifest names are normalized
-by replacing `::` with `__` and `.` with `_`. Resolution fails if multiple archive names normalize to the
-same reference.
+## Manifest-backed `.weights`
 
-## Writing
+For raw weights, the manifest contains a `tensors` object keyed by each `@weights` reference. Resolution uses
+`byteOffset` and `byteLength` as an absolute half-open byte range from the beginning of the `.weights` file.
 
-`write_external_weights_safetensors` accepts the graph, bytes keyed by weight reference, and a destination.
-It applies the same logical dtype, shape, packed-length, and marker rules as the reader. The archive is
-streamed to a uniquely named temporary file in the destination directory and renamed only after successful
-serialization, so an incomplete archive is never installed as the final path.
-# External weight format
+The weight utilities use this version-1 manifest shape:
 
-A `GraphJson` constant with `ConstInit::Weights { ref }`, rendered in `.webnn` as
-`@weights("ref")`, obtains its bytes from a sidecar. The graph declaration remains authoritative for
-the logical data type and shape.
+```json
+{
+  "format": "wg-weights-manifest",
+  "version": 1,
+  "endianness": "little",
+  "tensors": {
+    "weight": {
+      "dataType": "float32",
+      "shape": [2, 2],
+      "byteOffset": 8,
+      "byteLength": 16,
+      "layout": "row-major"
+    }
+  }
+}
+```
 
-## Discovery
+The external resolver accepts related manifest layouts as long as `tensors.<name>.byteOffset` and
+`byteLength` are present. It validates integer conversion, range addition, and file bounds. Graph dtype and
+shape remain authoritative during resolution; the richer manifest fields are consumed by the pack/unpack tools.
 
-An explicit weights path is resolved relative to the graph. Without one, discovery checks, in order:
+Two current producers use absolute offsets differently:
 
-1. `<graph-stem>.safetensors`
-2. `<graph-stem>.weights`
-3. `model.safetensors`
-4. `model.weights`
+- `pack-weights` and `extract-weights` write `WGWT`, followed by a little-endian U32 version (`1`), then tensor
+  bytes. Their first tensor offset is 8. `unpack-weights` and `inline-weights` validate this header.
+- `convert-onnx` writes a headerless concatenation whose first tensor offset is 0.
 
-A SafeTensors file is self-describing and ignores a manifest argument. A raw `.weights` file requires
-an explicit manifest or a discovered `<graph-stem>.manifest.json` or `manifest.json`. Manifest byte ranges
-are validated before they are copied.
+Because offsets are absolute, the shared external resolver can load both layouts without interpreting a header.
 
-Files are memory-mapped read-only during resolution. Each selected tensor is copied once into the owned
-`InlineBytes` representation used by `GraphJson` consumers.
+## SafeTensors writer
 
-## SafeTensors mapping
+`write_external_weights_safetensors` accepts a `GraphJson`, bytes keyed by weight reference, and a destination
+path. It rejects missing bytes, conflicting declarations, unsupported mappings, shape/length mismatches, and
+packed element-count overflow. It adds the packed-4-bit marker only when the graph contains external Int4 or
+Uint4 tensors.
 
-Logical types use the corresponding SafeTensors type: `float32`/F32, `float16`/F16, `int32`/I32,
-`uint32`/U32, `int64`/I64, `uint64`/U64, `int8`/I8, and `uint8`/U8. A BF16 tensor may satisfy a
-`float32` declaration; it is converted to F32 while loading. Shapes must otherwise match exactly.
-
-SafeTensors has no native 4-bit type. Logical `int4` and `uint4` declarations use the versioned extension:
-
-- archive metadata: `rustnn.webnn.packed4=1`
-- physical SafeTensors type: U8
-- physical shape: `[ceil(logical_element_count / 2)]`
-- byte layout: the first logical element is the low nibble, followed by the high nibble
-
-The loader requires the marker when a graph references an external 4-bit tensor and rejects unknown
-versions, non-U8 storage, incorrect physical shapes, length overflow, or missing references. Archives that
-contain only ordinary tensors need no marker and remain compatible with earlier files.
-
-## Names
-
-Exact tensor names take precedence. As a compatibility fallback, archive and manifest names are normalized
-by replacing `::` with `__` and `.` with `_`. Resolution fails if multiple archive names normalize to the
-same reference.
-
-## Writing
-
-`write_external_weights_safetensors` accepts the graph, bytes keyed by weight reference, and a destination.
-It applies the same logical dtype, shape, packed-length, and marker rules as the reader. The archive is
-streamed to a uniquely named temporary file in the destination directory and renamed only after successful
-serialization, so an incomplete archive is never installed as the final path.
+The writer calls `safetensors::serialize_to_file` for a uniquely named temporary file in the destination
+directory and renames it only after successful serialization. Failed serialization or installation removes the
+temporary file and does not install a partial final archive.
