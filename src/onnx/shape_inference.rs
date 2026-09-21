@@ -358,11 +358,7 @@ fn infer_node_shape(node: &NodeProto, ctx: &InferenceResult) -> Option<Vec<i64>>
         "Concat" => {
             let mut shapes = Vec::new();
             for inp in node.input.as_slice() {
-                if let Some(s) = ctx.value_shapes.get(inp.as_str()) {
-                    shapes.push(s.clone());
-                } else {
-                    return None;
-                }
+                shapes.push(ctx.value_shapes.get(inp.as_str())?.clone());
             }
             if shapes.is_empty() {
                 return None;
