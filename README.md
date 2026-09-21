@@ -118,6 +118,9 @@ It is:
 
 This separation allows the same graph definition to be reused with different trained weights.
 
+SafeTensors sidecars, discovery precedence, dtype mappings, packed 4-bit storage, and compatibility rules
+are documented in [External weight format](docs/external-weights.md).
+
 
 ## Core Idea
 
