@@ -26,9 +26,9 @@ same requested reference.
 
 ## Loading and ownership
 
-SafeTensors and raw `.weights` files are memory-mapped read-only while references are resolved. The mapping is
-dropped after every selected tensor range has been copied once into the owned `InlineBytes` representation used
-by `GraphJson` consumers. The format does not provide decode-time weight streaming.
+SafeTensors and raw `.weights` files are read into memory while references are resolved. Every selected tensor
+range is then copied into the owned `InlineBytes` representation used by `GraphJson` consumers. The format does
+not provide decode-time weight streaming.
 
 Callers must keep a sidecar immutable while it is being resolved. Producers should complete a temporary file
 and rename it into place rather than modifying an installed archive.

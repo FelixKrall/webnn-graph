@@ -2,12 +2,11 @@
 //! next to a graph path (SafeTensors or manifest + raw weights blob).
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use half::bf16;
-use memmap2::{Mmap, MmapOptions};
 use safetensors::tensor::{Dtype as StDtype, TensorView};
 use safetensors::SafeTensors;
 use serde::Deserialize;
@@ -214,13 +213,8 @@ fn resolve_tensor_view<'a>(
         .map_err(|e| WeightResolveError::Safetensors(format!("tensor `{ref}` (via `{orig}`): {e}")))
 }
 
-fn mmap_file(path: &Path) -> Result<Mmap, WeightResolveError> {
-    let file = File::open(path).map_err(|source| WeightResolveError::ReadFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    // The mapping is read-only and lives only while selected tensor ranges are copied into the AST.
-    unsafe { MmapOptions::new().map(&file) }.map_err(|source| WeightResolveError::ReadFile {
+fn read_file(path: &Path) -> Result<Vec<u8>, WeightResolveError> {
+    fs::read(path).map_err(|source| WeightResolveError::ReadFile {
         path: path.to_path_buf(),
         source,
     })
@@ -241,8 +235,8 @@ fn inline_weights_from_safetensors(
         weight_ref_count
     );
 
-    let mapped = mmap_file(safetensors_path)?;
-    let st = SafeTensors::deserialize(&mapped).map_err(|e| {
+    let archive_bytes = read_file(safetensors_path)?;
+    let st = SafeTensors::deserialize(&archive_bytes).map_err(|e| {
         WeightResolveError::Safetensors(format!("`{}`: {e}", safetensors_path.display()))
     })?;
     let sanitized_map = safetensors_sanitized_name_map(&st)?;
@@ -251,7 +245,7 @@ fn inline_weights_from_safetensors(
             && matches!(decl.init, ConstInit::Weights { .. })
     });
     if has_packed_refs {
-        validate_packed4_marker(&mapped, safetensors_path)?;
+        validate_packed4_marker(&archive_bytes, safetensors_path)?;
     }
 
     for (const_name, const_decl) in graph_json.consts.iter_mut() {
@@ -393,7 +387,7 @@ fn inline_weights_from_manifest(
             path: manifest_path.to_path_buf(),
             source,
         })?;
-    let weights_bytes = mmap_file(weights_path)?;
+    let weights_bytes = read_file(weights_path)?;
 
     let manifest: FlexibleManifest = serde_json::from_str(&manifest_text).map_err(|source| {
         WeightResolveError::ManifestJson {
@@ -1126,13 +1120,13 @@ mod tests {
         ]);
 
         write_external_weights_safetensors(&graph, &bytes, &archive_path).unwrap();
-        let mapped = mmap_file(&archive_path).unwrap();
-        let (_, metadata) = SafeTensors::read_metadata(&mapped).unwrap();
+        let archive_bytes = read_file(&archive_path).unwrap();
+        let (_, metadata) = SafeTensors::read_metadata(&archive_bytes).unwrap();
         assert_eq!(
             metadata.metadata().as_ref().unwrap()[PACKED_4BIT_METADATA_KEY],
             PACKED_4BIT_METADATA_VERSION
         );
-        let archive = SafeTensors::deserialize(&mapped).unwrap();
+        let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
         assert_eq!(archive.tensor("even").unwrap().shape(), [2]);
         assert_eq!(archive.tensor("odd").unwrap().shape(), [2]);
         assert_eq!(archive.tensor("float").unwrap().shape(), [2]);
